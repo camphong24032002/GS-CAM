@@ -46,99 +46,68 @@ def get_grad_cam(model, input_tensor):
     relu_cam = None
     return grad_cam
 
-def shapley_value(model, input_tensor, device='cuda', grad_cam = [], threshold = 0.5, num_samples = 10000, num_batches = 100):
-    with torch.no_grad():
-        grad_cam_indexes = []
-        # Get indexes of pixels that have the gradient over the threshold
-        for result in grad_cam:
-            grad_cam_indexes.append(set(map(tuple, np.column_stack(np.where(result > threshold)))))
-        # Get feature map
-        output = model.features(input_tensor)
-        np_output = output.cpu().detach().numpy()
-        
-        # Get target class
-        origin_output = model(input_tensor).cpu().detach().numpy()
-        target_class = np.argmax(origin_output, axis=1)
-        origin_output = None
-        num_images, num_channels, width, height = output.shape
-        N = width * height
-        values = []
-        # Loop through each image
-        for image_index in range(num_images):
-            # Get pixels that have the gradient lower than the threshold to apply shapley technique
-            arr = [(i, j) for i in range(width) for j in range(height)]
-            np.random.seed(0)
-            if len(grad_cam_indexes) != 0:
-                indexes = grad_cam_indexes[image_index]
-                for i in indexes:
-                    arr.remove(i)
-            else:
-                indexes = []
-            # Sh is used to store the shapley value of each pixel
-            Sh = np.zeros((num_samples, width, height))
-            pis = []
-            # Generate random samples
-            for i in range(num_samples):
-                random.shuffle(arr)
-                pis.append(arr[:])
-            del arr
-            # Calculate the average of the feature map
-            avg = F.avg_pool2d(output[image_index], (width, height)).squeeze() # Cai nay la tinh gap cho 960 channel -> shape (960, )
-            avg = avg.cpu().detach().numpy()
-            avg_tmp = np.copy(avg)
-            # Ignore selected pixel
-            for x, y in indexes:
-                avg = (avg*N - avg_tmp + np_output[image_index, :, x, y])/N
-            avg_tmp = None
-            batches_pi = []
-            batches_sample = []
-            batches = []
-            # Loop through each sample
-            for pi_idx, pi in enumerate(pis):
+def shapley_value(model, input_tensor, device='cuda', grad_cam = [], threshold = 0.5, num_samples = 1000, num_batches = 10):
+    device = torch.device(device)
+    grad_cam_indexes = []
+    for result in grad_cam:
+        grad_cam_indexes.append(set(map(tuple, np.column_stack(np.where(result > threshold)))))
+    output = model.features(input_tensor).squeeze()
+    np_output = output.detach().numpy()
+    target_class = np.argmax(model(input_tensor).detach(), axis=1)
+    num_images, num_channels, width, height = output.shape
+    N = width * height
+    model = model.to(device)
+    values = []
+    for image_index in range(num_images):
+        print(image_index)
+        arr = [(i, j) for i in range(width) for j in range(height)]
+        np.random.seed(0)
+        if len(grad_cam_indexes) != 0:
+            indexes = grad_cam_indexes[image_index]
+            for i in indexes:
+                arr.remove(i)
+        else:
+            indexes = []
+        Sh = np.array([np.zeros((width, height)) for i in range(num_samples)])
+        pis = []
+        for i in range(num_samples):
+            np.random.shuffle(arr)
+            pis.append(arr[:])
+        avg = F.avg_pool2d(output[image_index], (width, height)).squeeze() # Cai nay la tinh gap cho 960 channel -> shape (960, )
+        avg = avg.detach().numpy()
+        avg_tmp = np.copy(avg)
+        for x, y in indexes: # Gan san nhung pixel da duoc localize bang gradcam
+            avg = (avg*N - avg_tmp + np_output[image_index, :, x, y])/N
+        batches_pi = []
+        batches = []
+        batches_sample = []
+        with torch.no_grad():
+            for pi_index, pi in tqdm(enumerate(pis)):
                 gap = np.copy(avg)
-                batches_sample = []
-                # Calculate the gap of the feature map when adding a pixel
-                for x, y in pi:
-                    gap = (gap*N - avg + np_output[image_index, :, x, y])/N
-                    batches_sample.append(np.copy(gap))
-                gap = None
+                batches_sample = [gap]
+                for x, y in pi[:-1]:
+                      gap = (gap*N - avg + np_output[image_index, :, x, y])/N
+                      batches_sample.append(np.copy(gap))
                 batches_pi.append(pi)
                 batches.append(np.stack(batches_sample))
-                del batches_sample
-                batches_sample = []
-                if len(batches_pi) == num_batches:
-                    np_batches = np.stack(batches)
-                    tmp = torch.from_numpy(np_batches).to(device)
-                    phis = model.classifier(tmp).softmax(dim=-1)[:, :, target_class[image_index]]
+                if len(batches) == num_batches:
+                    phis = model.classifier(torch.from_numpy(np.stack(batches)).to(device))[:, :, target_class[image_index]]
                     phis = phis.cpu().detach().numpy()
-                    # Calculate the shapley value of each pixel
-                    for pi2_idx, (pi2, phi) in enumerate(zip(batches_pi, phis)):
-                        sample_idx = pi_idx - (num_batches - 1) + pi2_idx
-                        for idx, (x, y) in enumerate(pi2[:-1]):
-                            Sh[sample_idx][x][y] += phi[idx] - phi[idx-1]
-                    np_batches = None
-                    del batches
+                    for phi, new_pi in zip(phis, batches_pi): # Chay cong thuc f(pre(S_i)) - f(pre(S))
+                        for idx, (x, y) in enumerate(new_pi[:-1]):
+                            Sh[pi_index][x][y] += phi[idx+1] - phi[idx]
+                            x, y = new_pi[-1]
+                        Sh[pi_index][x][y] += phi[0] - phi[-1]
                     batches = []
-                    phis = None
-                    del batches_pi
                     batches_pi = []
-            mean_Sh = Sh.mean(axis=0)
-            relu_Sh = np.maximum(mean_Sh, 0)
-            relu_Sh = relu_Sh[np.newaxis, :, :]
-            scaled_Sh = scale_cam_image(relu_Sh)
+
+                torch.cuda.empty_cache()
+            Sh = np.array(Sh).sum(axis=0)
+            Sh /= num_samples
+            Sh = np.maximum(Sh, 0)
             for x, y in indexes:
-                scaled_Sh[:, x, y] = grad_cam[image_index][x][y]
-            values.append(scaled_Sh)
-            del indexes
-            avg = None
-            Sh = None
-            mean_Sh = None
-            relu_Sh = None
-            scaled_Sh = None
-            del pis
-        np_values = np.stack(values).squeeze(1)
-        del values
-        output = None
-        np_output = None
-        del grad_cam_indexes
-        return np_values # Shape (images, w, h)
+                Sh[x][y] = grad_cam[image_index][x][y]
+            Sh = scale_cam_image(Sh[None, :, :])
+        values.append(Sh)
+    model = model.to('cpu')
+    return np.stack(values).squeeze() # Shape (images, w, h)
